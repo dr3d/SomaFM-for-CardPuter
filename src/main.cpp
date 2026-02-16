@@ -24,6 +24,7 @@
 #include <AudioGeneratorMP3.h>
 #include <AudioOutput.h>
 #include <algorithm>
+#include <Preferences.h>
 #include "config.h"
 
 // ═══════════════════════════════════════════════════════════
@@ -76,6 +77,7 @@ struct Station {
     String imageUrl;
     uint16_t color;
     int listeners;
+    bool fav;
 };
 
 enum AppState {
@@ -123,7 +125,7 @@ unsigned long tLastNP     = 0;
 unsigned long tLastKey    = 0;
 unsigned long tLastEQ     = 0;
 const unsigned long DEBOUNCE_MS   = 180;
-const unsigned long UI_MS         = 120;
+const unsigned long UI_MS         = 66;
 const unsigned long NP_MS         = 30000;
 
 // EQ visualizer
@@ -134,6 +136,14 @@ uint8_t *logoData    = nullptr;
 size_t   logoDataLen = 0;
 int      logoForIdx  = -1;
 bool     logoValid   = false;
+
+// Scroll state for car-radio text effect
+struct ScrollState {
+    String text;
+    int    fullWidth;
+    unsigned long startMs;
+};
+ScrollState scrTitle, scrGenre, scrSong;
 
 // ═══════════════════════════════════════════════════════════
 //  UTILITY FUNCTIONS
@@ -193,6 +203,40 @@ String fitText(M5Canvas &c, const String &s, int maxPx) {
         if (c.textWidth(t) <= maxPx) return t;
     }
     return "~";
+}
+
+// Car-radio scrolling text: scrolls if text exceeds maxW, otherwise draws normally.
+// Uses TL_DATUM. Font must be set before calling.
+void drawScrollText(M5Canvas &c, const String &s, int x, int y,
+                    int maxW, ScrollState &ss) {
+    int tw = c.textWidth(s);
+    if (tw <= maxW) {
+        c.drawString(s, x, y);
+        ss.text = "";
+        return;
+    }
+    // Reset scroll on text change
+    if (s != ss.text) {
+        ss.text      = s;
+        ss.fullWidth = tw;
+        ss.startMs   = millis();
+    }
+    unsigned long elapsed = millis() - ss.startMs;
+    int pause = 2000;     // ms to show start before scrolling
+    int speed = 35;       // px/sec
+    int gap   = 50;       // px gap before text repeats
+    int cycle = ss.fullWidth + gap;
+
+    int offset = 0;
+    if (elapsed > (unsigned long)pause) {
+        offset = (int)((elapsed - pause) * speed / 1000) % cycle;
+    }
+
+    int fh = c.fontHeight();
+    c.setClipRect(x, y, maxW, fh);
+    c.drawString(s, x - offset, y);
+    c.drawString(s, x - offset + cycle, y);
+    c.clearClipRect();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -400,10 +444,67 @@ bool fetchChannels() {
         s.imageUrl  = o["image"].as<String>();
         s.listeners = o["listeners"].as<String>().toInt();
         s.color     = getGenreColor(s.genre);
+        s.fav       = false;
         stationCount++;
     }
     Serial.printf("[FETCH] Loaded %d stations\n", stationCount);
     return stationCount > 0;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  FAVORITES (persisted to NVS)
+// ═══════════════════════════════════════════════════════════
+Preferences prefs;
+
+void loadFavorites() {
+    prefs.begin("somafm", true);
+    String favs = prefs.getString("favs", "");
+    prefs.end();
+    for (int i = 0; i < stationCount; i++)
+        stations[i].fav = (favs.indexOf(stations[i].id) >= 0);
+    Serial.printf("[FAV] Loaded: %s\n", favs.c_str());
+}
+
+void saveFavorites() {
+    String favs = "";
+    for (int i = 0; i < stationCount; i++) {
+        if (stations[i].fav) {
+            if (favs.length() > 0) favs += ",";
+            favs += stations[i].id;
+        }
+    }
+    prefs.begin("somafm", false);
+    prefs.putString("favs", favs);
+    prefs.end();
+}
+
+void sortStations() {
+    // Remember which stations are selected/playing by ID
+    String selId  = (selectedIdx >= 0 && selectedIdx < stationCount)
+                    ? stations[selectedIdx].id : "";
+    String playId = (playingIdx >= 0 && playingIdx < stationCount)
+                    ? stations[playingIdx].id : "";
+
+    // Stable sort: favorites first, original order preserved within groups
+    std::stable_sort(stations, stations + stationCount,
+        [](const Station &a, const Station &b) { return a.fav && !b.fav; });
+
+    // Restore indices to follow the moved stations
+    for (int i = 0; i < stationCount; i++) {
+        if (selId.length()  && stations[i].id == selId)  selectedIdx = i;
+        if (playId.length() && stations[i].id == playId) playingIdx  = i;
+    }
+    if (selectedIdx >= (int)VISIBLE_LINES)
+        scrollOffset = selectedIdx - VISIBLE_LINES / 2;
+    else
+        scrollOffset = 0;
+}
+
+void toggleFavorite(int idx) {
+    if (idx < 0 || idx >= stationCount) return;
+    stations[idx].fav = !stations[idx].fav;
+    saveFavorites();
+    sortStations();
 }
 
 void fetchNowPlaying() {
@@ -498,19 +599,96 @@ void downloadLogo(int stationIdx) {
 // ═══════════════════════════════════════════════════════════
 //  UI COMPONENTS
 // ═══════════════════════════════════════════════════════════
+void drawBattery(int x, int y) {
+    int bw = 18, bh = 10, nub = 2;
+    int level = M5.Power.getBatteryLevel();  // 0-100
+    bool charging = M5.Power.isCharging();
+    // Body outline
+    canvas.drawRect(x, y, bw, bh, C_GRAY);
+    // Nub on right
+    canvas.fillRect(x + bw, y + 3, nub, 4, C_GRAY);
+    // Fill level
+    int fw = (bw - 4) * level / 100;
+    uint16_t fc = (level > 50) ? C_PLAYING : (level > 20) ? C_ACCENT : C_HEADER2;
+    if (charging) fc = C_PLAYING;
+    if (fw > 0) canvas.fillRect(x + 2, y + 2, fw, bh - 4, fc);
+}
+
 void drawHeader(const char *title, const char *right = nullptr) {
     drawGradient(canvas, 0, HEADER_H, C_HEADER1, C_HEADER2);
     canvas.setTextDatum(ML_DATUM);
     canvas.setTextColor(C_WHITE);
     canvas.setFont(&fonts::Font2);
     canvas.drawString(title, 6, HEADER_H / 2);
+    // Battery gauge (right edge)
+    drawBattery(SCREEN_W - 24, 6);
     if (right) {
         canvas.setTextDatum(MR_DATUM);
         canvas.setTextColor(C_GRAY);
         canvas.setFont(&fonts::Font0);
-        canvas.drawString(right, SCREEN_W - 4, HEADER_H / 2);
+        canvas.drawString(right, SCREEN_W - 28, HEADER_H / 2);
     }
     canvas.drawFastHLine(0, HEADER_H - 1, SCREEN_W, C_ACCENT);
+}
+
+// Draw a small 5px triangle arrow at (cx,cy) center
+void drawArrow(int cx, int cy, int dir, uint16_t col) {
+    // dir: 0=up, 1=down, 2=left, 3=right
+    int s = 3; // half-size
+    switch (dir) {
+        case 0: canvas.fillTriangle(cx, cy-s, cx-s, cy+s, cx+s, cy+s, col); break;
+        case 1: canvas.fillTriangle(cx, cy+s, cx-s, cy-s, cx+s, cy-s, col); break;
+        case 2: canvas.fillTriangle(cx-s, cy, cx+s, cy-s, cx+s, cy+s, col); break;
+        case 3: canvas.fillTriangle(cx+s, cy, cx-s, cy-s, cx-s, cy+s, col); break;
+    }
+}
+
+void drawFooterBrowser() {
+    int y = SCREEN_H - FOOTER_H;
+    int cy = y + FOOTER_H / 2 + 1;
+    canvas.fillRect(0, y, SCREEN_W, FOOTER_H, C_BG_DARK);
+    canvas.drawFastHLine(0, y, SCREEN_W, C_DARKGRAY);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(C_GRAY);
+    canvas.setTextDatum(ML_DATUM);
+    // up/down :Nav
+    int x = 4;
+    drawArrow(x + 2, cy, 0, C_GRAY); drawArrow(x + 10, cy, 1, C_GRAY);
+    canvas.drawString(":Nav", x + 16, cy);
+    // Enter:Play
+    x = 60;
+    canvas.drawString("Enter:Play", x, cy);
+    // f:Fav
+    x = 144;
+    canvas.drawString("f:Fav", x, cy);
+    // left/right :Vol
+    x = 186;
+    drawArrow(x + 2, cy, 2, C_GRAY); drawArrow(x + 10, cy, 3, C_GRAY);
+    canvas.drawString(":Vol", x + 16, cy);
+}
+
+void drawFooterPlayer() {
+    int y = SCREEN_H - FOOTER_H;
+    int cy = y + FOOTER_H / 2 + 1;
+    canvas.fillRect(0, y, SCREEN_W, FOOTER_H, C_BG_DARK);
+    canvas.drawFastHLine(0, y, SCREEN_W, C_DARKGRAY);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(C_GRAY);
+    canvas.setTextDatum(ML_DATUM);
+    // BS:Back
+    int x = 4;
+    canvas.drawString("BS:Back", x, cy);
+    // left/right :Vol
+    x = 62;
+    drawArrow(x + 2, cy, 2, C_GRAY); drawArrow(x + 10, cy, 3, C_GRAY);
+    canvas.drawString(":Vol", x + 16, cy);
+    // f:Fav
+    x = 118;
+    canvas.drawString("f:Fav", x, cy);
+    // up/down :Skip
+    x = 160;
+    drawArrow(x + 2, cy, 0, C_GRAY); drawArrow(x + 10, cy, 1, C_GRAY);
+    canvas.drawString(":Skip", x + 16, cy);
 }
 
 void drawFooter(const char *text) {
@@ -518,7 +696,7 @@ void drawFooter(const char *text) {
     canvas.fillRect(0, y, SCREEN_W, FOOTER_H, C_BG_DARK);
     canvas.drawFastHLine(0, y, SCREEN_W, C_DARKGRAY);
     canvas.setTextDatum(MC_DATUM);
-    canvas.setTextColor(C_DARKGRAY);
+    canvas.setTextColor(C_GRAY);
     canvas.setFont(&fonts::Font0);
     canvas.drawString(text, SCREEN_W / 2, y + FOOTER_H / 2 + 1);
 }
@@ -593,11 +771,20 @@ void drawBrowser() {
         if (playing) {
             canvas.fillCircle(5, y + LINE_H / 2, 2, C_PLAYING);
         }
+        if (stations[idx].fav) {
+            // Gold star for favorites
+            int sx = playing ? 12 : 5, sy = y + LINE_H / 2;
+            canvas.setFont(&fonts::Font0);
+            canvas.setTextDatum(MC_DATUM);
+            canvas.setTextColor(C_ACCENT);
+            canvas.drawString("*", sx, sy);
+        }
 
+        int nameX = 18;  // leave room for indicators
         canvas.setFont(&fonts::Font2);
         canvas.setTextDatum(ML_DATUM);
         canvas.setTextColor(sel ? C_WHITE : (playing ? C_PLAYING : C_GRAY));
-        canvas.drawString(fitText(canvas, stations[idx].title, SCREEN_W - 60), 12, y + LINE_H / 2);
+        canvas.drawString(fitText(canvas, stations[idx].title, SCREEN_W - 66), nameX, y + LINE_H / 2);
 
         canvas.setFont(&fonts::Font0);
         canvas.setTextDatum(MR_DATUM);
@@ -613,7 +800,7 @@ void drawBrowser() {
         canvas.fillRect(SCREEN_W - 2, thumbY, 2, thumbH, C_ACCENT);
     }
 
-    drawFooter("w/s:Nav Enter:Play ,/:Vol");
+    drawFooterBrowser();
     canvas.pushSprite(0, 0);
 }
 
@@ -632,7 +819,8 @@ void drawPlayer() {
     canvas.setTextColor(C_WHITE);
     canvas.setFont(&fonts::Font2);
     canvas.drawString("NOW PLAYING", 6, HEADER_H / 2);
-    if (aRunning) drawEqBars(SCREEN_W - 30, 4, 24, HEADER_H - 8);
+    if (aRunning) drawEqBars(SCREEN_W - 54, 4, 24, HEADER_H - 8);
+    drawBattery(SCREEN_W - 24, 6);
     canvas.drawFastHLine(0, HEADER_H - 1, SCREEN_W, st.color);
 
     // Logo (64x64)
@@ -646,13 +834,21 @@ void drawPlayer() {
     int rw = SCREEN_W - ix - 4;  // available width for right pane
 
     canvas.setTextDatum(TL_DATUM);
+    // Favorite star before title
+    int titleX = ix;
+    if (st.fav) {
+        canvas.setFont(&fonts::Font2);
+        canvas.setTextColor(C_ACCENT);
+        canvas.drawString("*", ix, CONTENT_Y + 3);
+        titleX += 10;
+    }
     canvas.setTextColor(C_WHITE);
     canvas.setFont(&fonts::FreeSansBold9pt7b);
-    canvas.drawString(fitText(canvas, st.title, rw), ix, CONTENT_Y + 3);
+    drawScrollText(canvas, st.title, titleX, CONTENT_Y + 3, rw - (titleX - ix), scrTitle);
 
     canvas.setFont(&fonts::Font2);
     canvas.setTextColor(st.color);
-    canvas.drawString(fitText(canvas, st.genre, rw), ix, CONTENT_Y + 20);
+    drawScrollText(canvas, st.genre, ix, CONTENT_Y + 20, rw, scrGenre);
 
     canvas.setFont(&fonts::Font0);
     canvas.setTextColor(C_DARKGRAY);
@@ -675,9 +871,9 @@ void drawPlayer() {
     canvas.setTextDatum(TL_DATUM);
     canvas.setTextColor(C_WHITE);
     String trk = nowTrack.length() > 0 ? nowTrack : "Loading track info...";
-    canvas.drawString(fitText(canvas, trk, SCREEN_W - 12), 6, dy + 8);
+    drawScrollText(canvas, trk, 6, dy + 8, SCREEN_W - 12, scrSong);
 
-    drawFooter("BS:Back ,/:Vol ;/.:Skip");
+    drawFooterPlayer();
     canvas.pushSprite(0, 0);
 }
 
@@ -771,6 +967,9 @@ void startPlaying(int idx) {
     playingIdx = idx;   // Update UI immediately
     aTarget    = idx;
     aCmd       = ACMD_PLAY;  // Single atomic write - audio task handles stop+start
+    scrTitle.text = "";  // Reset scroll positions for new station
+    scrGenre.text = "";
+    scrSong.text  = "";
     Serial.printf("[CMD] play(%d)\n", idx);
 }
 
@@ -780,7 +979,7 @@ void stopPlaying() {
 
 void setVolume(uint8_t v) {
     volume = v;
-    if (audioOut) audioOut->SetGain((float)v / 100.0f);
+    if (audioOut) audioOut->SetGain((float)v / 200.0f);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -823,6 +1022,7 @@ void handleBrowserKeys() {
         appState = STATE_PLAYING;
         tLastNP  = 0;
     }
+    if (hasKey(ks.word, 'f')) { toggleFavorite(selectedIdx); }
     if (hasKey(ks.word, ',')) { setVolume((volume > 15) ? volume - 15 : 0); }
     if (hasKey(ks.word, '/')) { setVolume((volume < 240) ? volume + 15 : 255); }
 }
@@ -847,6 +1047,7 @@ void handlePlayerKeys() {
         playingIdx = -1;
         appState   = STATE_BROWSER;
     }
+    if (hasKey(ks.word, 'f')) { toggleFavorite(playingIdx); }
     if (hasKey(ks.word, ',')) { setVolume((volume > 15) ? volume - 15 : 0); }
     if (hasKey(ks.word, '/')) { setVolume((volume < 240) ? volume + 15 : 255); }
     if (hasKey(ks.word, '.')) {
@@ -899,8 +1100,8 @@ void setup() {
     // Re-initialize ES8311 DAC registers
     es8311_init_dac();
 
-    // Set initial volume (gain 1.0 at volume=100)
-    audioOut->SetGain((float)volume / 100.0f);
+    // Set initial volume (gain 1.0 at volume=200, max ~1.27x at 255)
+    audioOut->SetGain((float)volume / 200.0f);
     Serial.printf("[SETUP] DirectI2S on port 1, ES8311 init, vol=%d\n", volume);
 
     // Launch audio task on Core 0
@@ -928,6 +1129,8 @@ void loop() {
             drawError();
             return;
         }
+        loadFavorites();
+        sortStations();
         appState = STATE_BROWSER;
     }
 
