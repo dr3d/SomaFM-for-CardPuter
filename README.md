@@ -16,6 +16,9 @@ Internet radio player for the **M5Stack Cardputer** that streams all [SOMA FM](h
 - Now-playing track info with auto-refresh
 - Car-radio style auto-scrolling text for long titles and song names
 - Favorite stations with persistent storage (pinned to top of list)
+- Pause / resume with space bar
+- LittleFS caching of channel list and station logos for fast startup
+- Remembers last selected station across reboots
 - Battery level gauge in the header bar
 - Volume control with on-screen bar
 - Quick station switching without stopping playback
@@ -83,4 +86,5 @@ Managed automatically by PlatformIO:
 - **Core 1**: UI rendering + input handling + network fetches
 - Direct I2S output on port 1 bypasses M5.Speaker for gapless audio
 - On Cardputer ADV, ES8311 codec is initialized via I2C; on the original Cardputer, the NS4168 amplifier needs no configuration
-- Favorites stored in NVS flash via the Preferences library
+- Favorites and last station stored in NVS flash via the Preferences library
+- Channel list and logos cached to LittleFS for instant startup on subsequent boots

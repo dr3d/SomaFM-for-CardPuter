@@ -25,6 +25,7 @@
 #include <AudioOutput.h>
 #include <algorithm>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include "config.h"
 
 // ═══════════════════════════════════════════════════════════
@@ -102,6 +103,7 @@ int       scrollOffset  = 0;
 int       playingIdx    = -1;
 uint8_t   volume        = DEFAULT_VOLUME;
 AppState  appState      = STATE_BOOT;
+bool      needsRefresh  = false;   // deferred network refresh after cached boot
 String    nowTrack      = "";
 String    errorMsg      = "";
 
@@ -349,6 +351,7 @@ private:
 //  WIFI
 // ═══════════════════════════════════════════════════════════
 bool connectWiFi() {
+    if (WiFi.status() == WL_CONNECTED) return true;
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     for (int i = 0; i < 40; i++) {
@@ -377,16 +380,66 @@ bool connectWiFi() {
 // ═══════════════════════════════════════════════════════════
 //  SOMA FM API
 // ═══════════════════════════════════════════════════════════
-bool fetchChannels() {
-    canvas.fillSprite(C_BG);
-    canvas.setTextDatum(MC_DATUM);
-    canvas.setFont(&fonts::FreeSansBold9pt7b);
-    canvas.setTextColor(C_ACCENT);
-    canvas.drawString("SOMA FM", SCREEN_W / 2, 40);
-    canvas.setFont(&fonts::Font2);
-    canvas.setTextColor(C_WHITE);
-    canvas.drawString("Loading stations...", SCREEN_W / 2, 75);
-    canvas.pushSprite(0, 0);
+bool parseChannelsJson(Stream &input) {
+    DynamicJsonDocument filter(256);
+    JsonObject cf = filter["channels"].createNestedObject();
+    cf["id"]          = true;
+    cf["title"]       = true;
+    cf["description"] = true;
+    cf["genre"]       = true;
+    cf["image"]       = true;
+    cf["listeners"]   = true;
+
+    DynamicJsonDocument doc(32768);
+    DeserializationError err = deserializeJson(
+        doc, input, DeserializationOption::Filter(filter));
+
+    if (err) {
+        Serial.printf("[PARSE] JSON error: %s\n", err.c_str());
+        return false;
+    }
+
+    JsonArray ch = doc["channels"];
+    stationCount = 0;
+    for (JsonObject o : ch) {
+        if (stationCount >= MAX_STATIONS) break;
+        Station &s  = stations[stationCount];
+        s.id        = o["id"].as<String>();
+        s.title     = o["title"].as<String>();
+        s.desc      = o["description"].as<String>();
+        s.genre     = o["genre"].as<String>();
+        s.imageUrl  = o["image"].as<String>();
+        s.listeners = o["listeners"].as<String>().toInt();
+        s.color     = getGenreColor(s.genre);
+        s.fav       = false;
+        stationCount++;
+    }
+    Serial.printf("[PARSE] Loaded %d stations\n", stationCount);
+    return stationCount > 0;
+}
+
+bool loadCachedChannels() {
+    if (!LittleFS.exists("/channels.json")) return false;
+    File f = LittleFS.open("/channels.json", "r");
+    if (!f) return false;
+    Serial.printf("[CACHE] Loading channels.json (%d bytes)\n", f.size());
+    bool ok = parseChannelsJson(f);
+    f.close();
+    return ok;
+}
+
+bool fetchChannels(bool showSplash = true) {
+    if (showSplash) {
+        canvas.fillSprite(C_BG);
+        canvas.setTextDatum(MC_DATUM);
+        canvas.setFont(&fonts::FreeSansBold9pt7b);
+        canvas.setTextColor(C_ACCENT);
+        canvas.drawString("SOMA FM", SCREEN_W / 2, 40);
+        canvas.setFont(&fonts::Font2);
+        canvas.setTextColor(C_WHITE);
+        canvas.drawString("Loading stations...", SCREEN_W / 2, 75);
+        canvas.pushSprite(0, 0);
+    }
 
     Serial.printf("[FETCH] Free heap: %u\n", ESP.getFreeHeap());
 
@@ -419,6 +472,20 @@ bool fetchChannels() {
 
     Serial.printf("[FETCH] Got 200, heap: %u\n", ESP.getFreeHeap());
 
+    // Read full response into a String so we can both parse and cache it
+    String payload = http.getString();
+    http.end();
+
+    // Save to flash cache
+    File f = LittleFS.open("/channels.json", "w");
+    if (f) {
+        f.print(payload);
+        f.close();
+        Serial.printf("[CACHE] Saved channels.json (%d bytes)\n", payload.length());
+    }
+
+    // Parse from the saved string
+    // ArduinoJson can deserialize from a const char*
     DynamicJsonDocument filter(256);
     JsonObject cf = filter["channels"].createNestedObject();
     cf["id"]          = true;
@@ -430,8 +497,7 @@ bool fetchChannels() {
 
     DynamicJsonDocument doc(32768);
     DeserializationError err = deserializeJson(
-        doc, http.getStream(), DeserializationOption::Filter(filter));
-    http.end();
+        doc, payload, DeserializationOption::Filter(filter));
 
     if (err) {
         errorMsg = String("JSON: ") + err.c_str();
@@ -484,6 +550,34 @@ void saveFavorites() {
     prefs.end();
 }
 
+void saveLastStation() {
+    if (selectedIdx >= 0 && selectedIdx < stationCount) {
+        prefs.begin("somafm", false);
+        prefs.putString("last", stations[selectedIdx].id);
+        prefs.end();
+    }
+}
+
+void ensureVisible() {
+    int maxOff = max(0, stationCount - (int)VISIBLE_LINES);
+    scrollOffset = max(0, min(selectedIdx - (int)VISIBLE_LINES / 2, maxOff));
+}
+
+void restoreLastStation() {
+    prefs.begin("somafm", true);
+    String lastId = prefs.getString("last", "");
+    prefs.end();
+    if (lastId.length() == 0) return;
+    for (int i = 0; i < stationCount; i++) {
+        if (stations[i].id == lastId) {
+            selectedIdx = i;
+            ensureVisible();
+            Serial.printf("[LAST] Restored: %s (idx %d)\n", lastId.c_str(), i);
+            return;
+        }
+    }
+}
+
 void sortStations() {
     // Remember which stations are selected/playing by ID
     String selId  = (selectedIdx >= 0 && selectedIdx < stationCount)
@@ -500,10 +594,7 @@ void sortStations() {
         if (selId.length()  && stations[i].id == selId)  selectedIdx = i;
         if (playId.length() && stations[i].id == playId) playingIdx  = i;
     }
-    if (selectedIdx >= (int)VISIBLE_LINES)
-        scrollOffset = selectedIdx - VISIBLE_LINES / 2;
-    else
-        scrollOffset = 0;
+    ensureVisible();
 }
 
 void toggleFavorite(int idx) {
@@ -545,10 +636,49 @@ void freeLogo() {
     logoValid   = false;
 }
 
+String logoCachePath(int stationIdx) {
+    return "/logos/" + stations[stationIdx].id + ".img";
+}
+
+bool loadCachedLogo(int stationIdx) {
+    String path = logoCachePath(stationIdx);
+    if (!LittleFS.exists(path)) return false;
+    File f = LittleFS.open(path, "r");
+    if (!f) return false;
+    int len = f.size();
+    if (len <= 0 || len > 25000) { f.close(); return false; }
+    logoData = (uint8_t *)malloc(len);
+    if (!logoData) { f.close(); return false; }
+    size_t read = f.readBytes((char *)logoData, len);
+    f.close();
+    if ((int)read == len) {
+        logoDataLen = len;
+        logoForIdx  = stationIdx;
+        logoValid   = true;
+        Serial.printf("[LOGO] Cache hit: %s (%d bytes)\n", path.c_str(), len);
+        return true;
+    }
+    free(logoData); logoData = nullptr;
+    return false;
+}
+
+void saveCachedLogo(int stationIdx) {
+    String path = logoCachePath(stationIdx);
+    File f = LittleFS.open(path, "w");
+    if (f) {
+        f.write(logoData, logoDataLen);
+        f.close();
+        Serial.printf("[LOGO] Cached: %s (%d bytes)\n", path.c_str(), logoDataLen);
+    }
+}
+
 void downloadLogo(int stationIdx) {
-    if (stationIdx == logoForIdx && logoValid) return;  // already cached
+    if (stationIdx == logoForIdx && logoValid) return;  // already in RAM
     freeLogo();
     if (stationIdx < 0 || stationIdx >= stationCount) return;
+
+    // Check flash cache first
+    if (loadCachedLogo(stationIdx)) return;
 
     String url = stations[stationIdx].imageUrl;
     if (url.length() == 0) return;
@@ -595,6 +725,7 @@ void downloadLogo(int stationIdx) {
         logoForIdx  = stationIdx;
         logoValid   = true;
         Serial.printf("[LOGO] OK %d bytes, heap=%u\n", len, ESP.getFreeHeap());
+        saveCachedLogo(stationIdx);  // persist to flash
     } else {
         Serial.printf("[LOGO] Read mismatch: %d/%d\n", read, len);
         freeLogo();
@@ -972,11 +1103,13 @@ void audioTask(void *) {
 void startPlaying(int idx) {
     aPaused    = false;
     playingIdx = idx;   // Update UI immediately
+    selectedIdx = idx;
     aTarget    = idx;
     aCmd       = ACMD_PLAY;  // Single atomic write - audio task handles stop+start
     scrTitle.text = "";  // Reset scroll positions for new station
     scrGenre.text = "";
     scrSong.text  = "";
+    saveLastStation();
     Serial.printf("[CMD] play(%d)\n", idx);
 }
 
@@ -1109,6 +1242,29 @@ void setup() {
     M5.Display.setBrightness(80);
     canvas.createSprite(SCREEN_W, SCREEN_H);
 
+    // Show splash immediately
+    canvas.fillSprite(C_BG);
+    canvas.setTextDatum(MC_DATUM);
+    canvas.setFont(&fonts::FreeSansBold9pt7b);
+    canvas.setTextColor(C_ACCENT);
+    canvas.drawString("SOMA FM", SCREEN_W / 2, 50);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(C_DARKGRAY);
+    canvas.drawString("Connecting...", SCREEN_W / 2, 80);
+    canvas.pushSprite(0, 0);
+
+    // Start WiFi early (non-blocking) so it connects while we load cache
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    // Persistent flash cache for channels + logos
+    if (!LittleFS.begin(true)) {
+        Serial.println("[FS] LittleFS mount failed");
+    } else {
+        Serial.println("[FS] LittleFS mounted");
+        if (!LittleFS.exists("/logos")) LittleFS.mkdir("/logos");
+    }
+
     // Release M5.Speaker's I2S port so we can drive it directly
     M5.Speaker.end();
     delay(100);
@@ -1138,6 +1294,17 @@ void loop() {
 
     // ── Boot sequence ──
     if (appState == STATE_BOOT) {
+        if (loadCachedChannels()) {
+            // Instant boot from cache — show browser immediately
+            Serial.printf("[BOOT] Cached %d stations\n", stationCount);
+            loadFavorites();
+            sortStations();
+            restoreLastStation();
+            appState = STATE_BROWSER;
+            needsRefresh = true;  // refresh from network on next passes
+            return;  // show UI immediately, don't block on WiFi
+        }
+        // No cache — must fetch from network
         if (!connectWiFi()) {
             errorMsg = "WiFi connection failed";
             appState = STATE_ERROR;
@@ -1151,7 +1318,20 @@ void loop() {
         }
         loadFavorites();
         sortStations();
+        restoreLastStation();
         appState = STATE_BROWSER;
+    }
+
+    // ── Deferred network refresh (non-blocking — only when WiFi ready) ──
+    if (needsRefresh && WiFi.status() == WL_CONNECTED) {
+        needsRefresh = false;
+        Serial.println("[REFRESH] WiFi connected, updating channels...");
+        if (fetchChannels(false)) {
+            loadFavorites();
+            sortStations();
+            restoreLastStation();
+            Serial.println("[REFRESH] Updated from network");
+        }
     }
 
     // ── Input ──
