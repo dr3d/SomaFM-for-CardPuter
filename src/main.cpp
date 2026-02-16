@@ -331,18 +331,18 @@ public:
     bool ConsumeSample(int16_t sample[2]) override {
         if (aCmd != ACMD_NONE) return false;
 
+        int16_t raw = ((int32_t)sample[LEFTCHANNEL] + sample[RIGHTCHANNEL]) / 2;
         int16_t mono;
         if (aPaused) {
             mono = 0;
         } else {
-            mono = ((int32_t)sample[LEFTCHANNEL] + sample[RIGHTCHANNEL]) / 2;
-            mono = (int16_t)(((int32_t)mono * gainF2P6) >> 6);
+            mono = (int16_t)(((int32_t)raw * gainF2P6) >> 6);
         }
         _buf[_bp++] = mono;  // L
         _buf[_bp++] = mono;  // R
 
-        // Feed visualizer (cheap — just track amplitude)
-        uint16_t absMono = (mono < 0) ? -mono : mono;
+        // Feed visualizer from pre-gain signal (independent of volume)
+        uint16_t absMono = (raw < 0) ? -raw : raw;
         _peakAcc += absMono;
         _peakCnt++;
         _binAcc[_binIdx] += absMono;
@@ -364,7 +364,7 @@ public:
         _waveSub++;
         if (_waveSub >= 11) {
             _waveSub = 0;
-            visWave[visWaveW] = (int8_t)(mono >> 8);  // 16-bit → 8-bit
+            visWave[visWaveW] = (int8_t)(raw >> 8);  // 16-bit → 8-bit
             visWaveW = (visWaveW + 1) % VIS_WAVE_N;
         }
 
