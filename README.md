@@ -2,6 +2,8 @@
 
 Internet radio player for the **M5Stack Cardputer** that streams all [SOMA FM](https://somafm.com) channels.
 
+![SomaFM for CardPuter](some-fm-for-cardputer.jpg)
+
 ![Platform](https://img.shields.io/badge/platform-ESP32--S3-blue)
 ![Framework](https://img.shields.io/badge/framework-Arduino-green)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
