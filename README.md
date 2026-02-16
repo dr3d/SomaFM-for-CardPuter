@@ -20,9 +20,9 @@ Internet radio player for the **M5Stack Cardputer** that streams all [SOMA FM](h
 - LittleFS caching of channel list and station logos for fast startup
 - Remembers last selected station across reboots
 - Battery level gauge in the header bar
-- Volume control with on-screen bar
+- Audio visualizers: EQ bars, waveform, VU meter (Tab to cycle)
+- Volume control with on-screen bar (remembered across reboots)
 - Quick station switching without stopping playback
-- EQ visualizer animation
 
 ## Hardware
 
@@ -45,6 +45,7 @@ No PSRAM required.
 | `,` / `/` | Volume down / up |
 | `f` | Toggle favorite |
 | `Space` | Pause / resume (or play selected) |
+| `Tab` | Cycle visualizer (off / bars / wave / VU) |
 | `Enter` | Play station |
 
 ### Now Playing
@@ -56,6 +57,7 @@ No PSRAM required.
 | `,` / `/` | Volume down / up |
 | `f` | Toggle favorite |
 | `Space` | Pause / resume |
+| `Tab` | Cycle visualizer |
 
 ## Setup
 

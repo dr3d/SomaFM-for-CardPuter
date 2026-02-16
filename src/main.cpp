@@ -126,13 +126,33 @@ volatile int  aTarget     = -1;
 unsigned long tLastUI     = 0;
 unsigned long tLastNP     = 0;
 unsigned long tLastKey    = 0;
-unsigned long tLastEQ     = 0;
 const unsigned long DEBOUNCE_MS   = 180;
 const unsigned long UI_MS         = 66;
 const unsigned long NP_MS         = 30000;
 
-// EQ visualizer
-uint8_t eqBars[5] = {3, 6, 4, 7, 5};
+// Audio visualizer
+#define VIS_OFF   0
+#define VIS_BARS  1
+#define VIS_WAVE  2
+#define VIS_VU    3
+#define VIS_COUNT 4
+volatile int visMode = VIS_BARS;
+
+// Audio data shared from Core 0 → Core 1
+#define VIS_BINS   16          // number of amplitude bins for bars
+#define VIS_WAVE_N 120         // waveform sample count (matches pixel width)
+volatile uint16_t visPeak = 0; // overall peak amplitude (0-32767)
+volatile uint8_t  visBins[VIS_BINS];   // amplitude per bin (0-255)
+volatile int8_t   visWave[VIS_WAVE_N]; // waveform samples (-128..127)
+volatile int      visWaveW = 0;        // write index into visWave
+
+// Accumulator for bins (used in ConsumeSample on Core 0)
+static uint32_t _binAcc[VIS_BINS];
+static int      _binIdx = 0;
+static int      _binCnt = 0;
+static uint32_t _peakAcc = 0;
+static int      _peakCnt = 0;
+static int      _waveSub = 0;
 
 // Logo cache
 uint8_t *logoData    = nullptr;
@@ -320,6 +340,33 @@ public:
         }
         _buf[_bp++] = mono;  // L
         _buf[_bp++] = mono;  // R
+
+        // Feed visualizer (cheap — just track amplitude)
+        uint16_t absMono = (mono < 0) ? -mono : mono;
+        _peakAcc += absMono;
+        _peakCnt++;
+        _binAcc[_binIdx] += absMono;
+        _binCnt++;
+        // ~44100/VIS_BINS/30 ≈ 92 samples per bin per frame at 30fps
+        if (_binCnt >= 92) {
+            visBins[_binIdx] = min(255u, (uint32_t)(_binAcc[_binIdx] / _binCnt) >> 5);
+            _binAcc[_binIdx] = 0;
+            _binCnt = 0;
+            _binIdx = (_binIdx + 1) % VIS_BINS;
+        }
+        if (_peakCnt >= 735) {  // ~60fps peak update (44100/60)
+            visPeak = min(32767u, (uint32_t)(_peakAcc / _peakCnt));
+            _peakAcc = 0;
+            _peakCnt = 0;
+        }
+        // Waveform: downsample to VIS_WAVE_N samples per ~30ms window
+        // 44100/VIS_WAVE_N/33 ≈ 11 samples between captures
+        _waveSub++;
+        if (_waveSub >= 11) {
+            _waveSub = 0;
+            visWave[visWaveW] = (int8_t)(mono >> 8);  // 16-bit → 8-bit
+            visWaveW = (visWaveW + 1) % VIS_WAVE_N;
+        }
 
         if (_bp >= BUF_SZ) {
             size_t written = 0;
@@ -846,11 +893,80 @@ void drawVolumeBar(int x, int y, int w, int h) {
 }
 
 void drawEqBars(int x, int y, int w, int h) {
+    // Mini EQ in header — driven by real audio data
     int bw = (w - 4) / 5;
     for (int i = 0; i < 5; i++) {
-        int bh = eqBars[i] * h / 10;
+        int bh = visBins[i * 3] * h / 255;
+        if (bh < 1) bh = 1;
         uint16_t c = blendRGB(C_PLAYING, C_ACCENT, i * 50);
         canvas.fillRect(x + i * (bw + 1), y + h - bh, bw, bh, c);
+    }
+}
+
+void drawVisBars(int x, int y, int w, int h, uint16_t color) {
+    int bw = max(2, (w - VIS_BINS + 1) / VIS_BINS);
+    int gap = 1;
+    int totalW = VIS_BINS * (bw + gap) - gap;
+    int ox = x + (w - totalW) / 2;
+    for (int i = 0; i < VIS_BINS; i++) {
+        int bh = visBins[i] * h / 255;
+        if (bh < 1) bh = 1;
+        uint16_t c = blendRGB(color, C_ACCENT, i * 255 / VIS_BINS);
+        canvas.fillRect(ox + i * (bw + gap), y + h - bh, bw, bh, c);
+    }
+}
+
+void drawVisWave(int x, int y, int w, int h, uint16_t color) {
+    int mid = y + h / 2;
+    int r = visWaveW;  // read from current write position (oldest sample)
+    int step = max(1, VIS_WAVE_N / w);
+    int prevY = mid;
+    for (int px = 0; px < w; px++) {
+        int idx = (r + px * step) % VIS_WAVE_N;
+        int sy = mid - (visWave[idx] * h / 256);
+        sy = max(y, min(y + h - 1, sy));
+        if (px > 0) {
+            // Draw line between points
+            int y0 = min(prevY, sy), y1 = max(prevY, sy);
+            canvas.drawFastVLine(x + px, y0, y1 - y0 + 1, color);
+        }
+        prevY = sy;
+    }
+}
+
+void drawVisVU(int x, int y, int w, int h, uint16_t color) {
+    static int peakHold = 0;
+    static unsigned long peakTime = 0;
+    int level = min(w, (int)(visPeak * w / 8000));
+    if (level > peakHold) { peakHold = level; peakTime = millis(); }
+    if (millis() - peakTime > 800) { peakHold = max(0, peakHold - 2); }
+    // Background
+    canvas.fillRect(x, y, w, h, C_BG_DARK);
+    // Green/yellow/red segments
+    int seg1 = w * 60 / 100, seg2 = w * 85 / 100;
+    if (level > 0) {
+        int g = min(level, seg1);
+        canvas.fillRect(x, y, g, h, C_PLAYING);
+    }
+    if (level > seg1) {
+        int yw = min(level, seg2) - seg1;
+        canvas.fillRect(x + seg1, y, yw, h, C_ACCENT);
+    }
+    if (level > seg2) {
+        canvas.fillRect(x + seg2, y, level - seg2, h, C_HEADER2);
+    }
+    // Peak hold marker
+    if (peakHold > 2) {
+        canvas.fillRect(x + peakHold - 2, y, 2, h, C_WHITE);
+    }
+}
+
+void drawVisualizer(int x, int y, int w, int h, uint16_t color) {
+    switch (visMode) {
+        case VIS_BARS: drawVisBars(x, y, w, h, color); break;
+        case VIS_WAVE: drawVisWave(x, y, w, h, color); break;
+        case VIS_VU:   drawVisVU(x, y, w, h, color); break;
+        default: break;
     }
 }
 
@@ -1003,12 +1119,22 @@ void drawPlayer() {
     int dy = CONTENT_Y + 68;
     canvas.drawFastHLine(4, dy, SCREEN_W - 8, C_DARKGRAY);
 
-    // Current song (full width, shifted down)
-    canvas.setFont(&fonts::Font2);
-    canvas.setTextDatum(TL_DATUM);
-    canvas.setTextColor(C_WHITE);
-    String trk = nowTrack.length() > 0 ? nowTrack : "Loading track info...";
-    drawScrollText(canvas, trk, 6, dy + 8, SCREEN_W - 12, scrSong);
+    int visY = dy + 3;
+    int visH = SCREEN_H - FOOTER_H - visY - 2;
+
+    if (visMode == VIS_OFF) {
+        // Current song (full width)
+        canvas.setFont(&fonts::Font2);
+        canvas.setTextDatum(TL_DATUM);
+        canvas.setTextColor(C_WHITE);
+        String trk = nowTrack.length() > 0 ? nowTrack : "Loading track info...";
+        drawScrollText(canvas, trk, 6, dy + 8, SCREEN_W - 12, scrSong);
+    } else {
+        // Visualizer fills the area below divider
+        if (aRunning && !aPaused) {
+            drawVisualizer(4, visY, SCREEN_W - 8, visH, st.color);
+        }
+    }
 
     drawFooterPlayer();
     canvas.pushSprite(0, 0);
@@ -1123,6 +1249,26 @@ void setVolume(uint8_t v) {
     if (audioOut) audioOut->SetGain((float)v / 200.0f);
 }
 
+void saveSettings() {
+    prefs.begin("somafm", false);
+    prefs.putUChar("vol", volume);
+    prefs.putUChar("vis", (uint8_t)visMode);
+    prefs.end();
+}
+
+void loadSettings() {
+    prefs.begin("somafm", true);
+    volume  = prefs.getUChar("vol", DEFAULT_VOLUME);
+    visMode = prefs.getUChar("vis", VIS_BARS);
+    prefs.end();
+    if (visMode >= VIS_COUNT) visMode = VIS_BARS;
+}
+
+void cycleVisMode() {
+    visMode = (visMode + 1) % VIS_COUNT;
+    saveSettings();
+}
+
 // ═══════════════════════════════════════════════════════════
 //  INPUT HANDLING
 // ═══════════════════════════════════════════════════════════
@@ -1175,8 +1321,9 @@ void handleBrowserKeys() {
         }
     }
     if (hasKey(ks.word, 'f')) { toggleFavorite(selectedIdx); }
-    if (hasKey(ks.word, ',')) { setVolume((volume > 15) ? volume - 15 : 0); }
-    if (hasKey(ks.word, '/')) { setVolume((volume < 240) ? volume + 15 : 255); }
+    if (ks.tab) { cycleVisMode(); }
+    if (hasKey(ks.word, ',')) { setVolume((volume > 15) ? volume - 15 : 0); saveSettings(); }
+    if (hasKey(ks.word, '/')) { setVolume((volume < 240) ? volume + 15 : 255); saveSettings(); }
 }
 
 void handlePlayerKeys() {
@@ -1201,8 +1348,9 @@ void handlePlayerKeys() {
     }
     if (hasKey(ks.word, 'f')) { toggleFavorite(playingIdx); }
     if (hasKey(ks.word, ' ')) { aPaused = !aPaused; }
-    if (hasKey(ks.word, ',')) { setVolume((volume > 15) ? volume - 15 : 0); }
-    if (hasKey(ks.word, '/')) { setVolume((volume < 240) ? volume + 15 : 255); }
+    if (ks.tab) { cycleVisMode(); }
+    if (hasKey(ks.word, ',')) { setVolume((volume > 15) ? volume - 15 : 0); saveSettings(); }
+    if (hasKey(ks.word, '/')) { setVolume((volume < 240) ? volume + 15 : 255); saveSettings(); }
     if (hasKey(ks.word, '.')) {
         int next = (playingIdx + 1) % stationCount;
         selectedIdx = next;
@@ -1276,9 +1424,10 @@ void setup() {
     // Re-initialize ES8311 DAC registers
     es8311_init_dac();
 
-    // Set initial volume (gain 1.0 at volume=200, max ~1.27x at 255)
+    // Restore saved volume and visualizer mode
+    loadSettings();
     audioOut->SetGain((float)volume / 200.0f);
-    Serial.printf("[SETUP] DirectI2S on port 1, ES8311 init, vol=%d\n", volume);
+    Serial.printf("[SETUP] DirectI2S on port 1, ES8311 init, vol=%d vis=%d\n", volume, visMode);
 
     // Launch audio task on Core 0
     xTaskCreatePinnedToCore(audioTask, "audio", 16384, nullptr, 2, &audioTaskH, 0);
@@ -1351,14 +1500,6 @@ void loop() {
         // Download logo if not yet cached
         if (logoForIdx != playingIdx) {
             downloadLogo(playingIdx);
-        }
-    }
-
-    // ── Periodic: animate EQ bars ──
-    if (millis() - tLastEQ > 250) {
-        tLastEQ = millis();
-        if (aRunning) {
-            for (int i = 0; i < 5; i++) eqBars[i] = random(2, 10);
         }
     }
 
