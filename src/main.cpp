@@ -116,6 +116,7 @@ AudioGeneratorMP3            *mp3         = nullptr;
 // Audio task
 TaskHandle_t  audioTaskH  = nullptr;
 volatile bool aRunning    = false;
+volatile bool aPaused     = false;
 volatile int  aCmd        = ACMD_NONE;
 volatile int  aTarget     = -1;
 
@@ -308,8 +309,13 @@ public:
     bool ConsumeSample(int16_t sample[2]) override {
         if (aCmd != ACMD_NONE) return false;
 
-        int16_t mono = ((int32_t)sample[LEFTCHANNEL] + sample[RIGHTCHANNEL]) / 2;
-        mono = (int16_t)(((int32_t)mono * gainF2P6) >> 6);
+        int16_t mono;
+        if (aPaused) {
+            mono = 0;
+        } else {
+            mono = ((int32_t)sample[LEFTCHANNEL] + sample[RIGHTCHANNEL]) / 2;
+            mono = (int16_t)(((int32_t)mono * gainF2P6) >> 6);
+        }
         _buf[_bp++] = mono;  // L
         _buf[_bp++] = mono;  // R
 
@@ -663,8 +669,8 @@ void drawFooterBrowser() {
     canvas.drawString("f:Fav", x, cy);
     // left/right :Vol
     x = 186;
-    drawArrow(x + 2, cy, 2, C_GRAY); drawArrow(x + 10, cy, 3, C_GRAY);
-    canvas.drawString(":Vol", x + 16, cy);
+    drawArrow(x + 2, cy, 2, C_GRAY); drawArrow(x + 12, cy, 3, C_GRAY);
+    canvas.drawString(":Vol", x + 18, cy);
 }
 
 void drawFooterPlayer() {
@@ -680,10 +686,10 @@ void drawFooterPlayer() {
     canvas.drawString("BS:Back", x, cy);
     // left/right :Vol
     x = 62;
-    drawArrow(x + 2, cy, 2, C_GRAY); drawArrow(x + 10, cy, 3, C_GRAY);
-    canvas.drawString(":Vol", x + 16, cy);
+    drawArrow(x + 2, cy, 2, C_GRAY); drawArrow(x + 12, cy, 3, C_GRAY);
+    canvas.drawString(":Vol", x + 18, cy);
     // f:Fav
-    x = 118;
+    x = 120;
     canvas.drawString("f:Fav", x, cy);
     // up/down :Skip
     x = 160;
@@ -857,8 +863,8 @@ void drawPlayer() {
     // Status + volume bar in right pane
     canvas.setFont(&fonts::Font0);
     canvas.setTextDatum(TL_DATUM);
-    canvas.setTextColor(aRunning ? C_PLAYING : C_ACCENT);
-    String statusTxt = aRunning ? "STREAM" : "BUFFER";
+    canvas.setTextColor(aPaused ? C_ACCENT : (aRunning ? C_PLAYING : C_ACCENT));
+    String statusTxt = aPaused ? "PAUSED" : (aRunning ? "STREAM" : "BUFFER");
     canvas.drawString(statusTxt, ix, CONTENT_Y + 50);
     drawVolumeBar(ix + 44, CONTENT_Y + 49, rw - 48, 10);
 
@@ -964,6 +970,7 @@ void audioTask(void *) {
 }
 
 void startPlaying(int idx) {
+    aPaused    = false;
     playingIdx = idx;   // Update UI immediately
     aTarget    = idx;
     aCmd       = ACMD_PLAY;  // Single atomic write - audio task handles stop+start
@@ -974,6 +981,7 @@ void startPlaying(int idx) {
 }
 
 void stopPlaying() {
+    aPaused = false;
     aCmd = ACMD_STOP;
 }
 
@@ -1022,6 +1030,17 @@ void handleBrowserKeys() {
         appState = STATE_PLAYING;
         tLastNP  = 0;
     }
+    if (hasKey(ks.word, ' ')) {
+        if (playingIdx >= 0) {
+            aPaused = !aPaused;
+        } else {
+            nowTrack = "";
+            freeLogo();
+            startPlaying(selectedIdx);
+            appState = STATE_PLAYING;
+            tLastNP  = 0;
+        }
+    }
     if (hasKey(ks.word, 'f')) { toggleFavorite(selectedIdx); }
     if (hasKey(ks.word, ',')) { setVolume((volume > 15) ? volume - 15 : 0); }
     if (hasKey(ks.word, '/')) { setVolume((volume < 240) ? volume + 15 : 255); }
@@ -1048,6 +1067,7 @@ void handlePlayerKeys() {
         appState   = STATE_BROWSER;
     }
     if (hasKey(ks.word, 'f')) { toggleFavorite(playingIdx); }
+    if (hasKey(ks.word, ' ')) { aPaused = !aPaused; }
     if (hasKey(ks.word, ',')) { setVolume((volume > 15) ? volume - 15 : 0); }
     if (hasKey(ks.word, '/')) { setVolume((volume < 240) ? volume + 15 : 255); }
     if (hasKey(ks.word, '.')) {

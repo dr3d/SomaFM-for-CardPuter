@@ -41,6 +41,7 @@ No PSRAM required.
 | `e` | Page down |
 | `,` / `/` | Volume down / up |
 | `f` | Toggle favorite |
+| `Space` | Pause / resume (or play selected) |
 | `Enter` | Play station |
 
 ### Now Playing
@@ -51,6 +52,7 @@ No PSRAM required.
 | `;` / `.` | Previous / next station |
 | `,` / `/` | Volume down / up |
 | `f` | Toggle favorite |
+| `Space` | Pause / resume |
 
 ## Setup
 
