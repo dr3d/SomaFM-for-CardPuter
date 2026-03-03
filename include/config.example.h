@@ -1,12 +1,6 @@
 #pragma once
 
 // ──────────────────────────────────────────────────────────
-// WiFi Configuration  (EDIT THESE!)
-// ──────────────────────────────────────────────────────────
-#define WIFI_SSID       "your_ssid"
-#define WIFI_PASS       "your_password"
-
-// ──────────────────────────────────────────────────────────
 // Audio Stream Settings
 // ──────────────────────────────────────────────────────────
 // Format: "mp3" (most compatible) or "aac"

@@ -83,6 +83,8 @@ struct Station {
 
 enum AppState {
     STATE_BOOT,
+    STATE_WIFI_SCAN,
+    STATE_WIFI_PASS,
     STATE_BROWSER,
     STATE_PLAYING,
     STATE_ERROR
@@ -167,6 +169,22 @@ struct ScrollState {
     unsigned long startMs;
 };
 ScrollState scrTitle, scrGenre, scrSong;
+
+// WiFi setup
+#define MAX_SCAN_RESULTS 20
+struct ScanResult {
+    String ssid;
+    int32_t rssi;
+    bool open;
+};
+ScanResult  scanResults[MAX_SCAN_RESULTS];
+int         scanCount       = 0;
+int         scanSelectedIdx = 0;
+int         scanScrollOff   = 0;
+String      wifiInputSSID   = "";
+String      wifiInputPass   = "";
+String      wifiError       = "";
+unsigned long wifiErrorTime = 0;
 
 // ═══════════════════════════════════════════════════════════
 //  UTILITY FUNCTIONS
@@ -397,13 +415,72 @@ private:
 // ═══════════════════════════════════════════════════════════
 //  WIFI
 // ═══════════════════════════════════════════════════════════
-bool connectWiFi() {
-    if (WiFi.status() == WL_CONNECTED) return true;
+void startWifiScan() {
+    scanCount = 0;
+    scanSelectedIdx = 0;
+    scanScrollOff   = 0;
+    wifiError = "";
+
+    // Show scanning message
+    canvas.fillSprite(C_BG);
+    canvas.setTextDatum(MC_DATUM);
+    canvas.setFont(&fonts::FreeSansBold9pt7b);
+    canvas.setTextColor(C_ACCENT);
+    canvas.drawString("SOMA FM", SCREEN_W / 2, 40);
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextColor(C_WHITE);
+    canvas.drawString("Scanning networks...", SCREEN_W / 2, 75);
+    canvas.pushSprite(0, 0);
+
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    for (int i = 0; i < 40; i++) {
-        if (WiFi.status() == WL_CONNECTED) return true;
+    WiFi.disconnect();
+    delay(100);
+    int n = WiFi.scanNetworks();
+    Serial.printf("[WIFI] Scan found %d networks\n", n);
+
+    for (int i = 0; i < n && scanCount < MAX_SCAN_RESULTS; i++) {
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0) continue;  // skip hidden
+        // Deduplicate — keep strongest signal per SSID
+        bool dup = false;
+        for (int j = 0; j < scanCount; j++) {
+            if (scanResults[j].ssid == ssid) {
+                if (WiFi.RSSI(i) > scanResults[j].rssi)
+                    scanResults[j].rssi = WiFi.RSSI(i);
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            scanResults[scanCount].ssid = ssid;
+            scanResults[scanCount].rssi = WiFi.RSSI(i);
+            scanResults[scanCount].open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+            scanCount++;
+        }
+    }
+    WiFi.scanDelete();
+
+    // Sort by signal strength (strongest first)
+    std::sort(scanResults, scanResults + scanCount,
+        [](const ScanResult &a, const ScanResult &b) { return a.rssi > b.rssi; });
+}
+
+bool tryWifiConnect(const String &ssid, const String &pass, int timeoutSec = 15) {
+    WiFi.disconnect();
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    if (pass.length() > 0)
+        WiFi.begin(ssid.c_str(), pass.c_str());
+    else
+        WiFi.begin(ssid.c_str());
+
+    for (int i = 0; i < timeoutSec * 2; i++) {
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("[WIFI] Connected to %s\n", ssid.c_str());
+            return true;
+        }
         delay(500);
+        // Show connecting animation
         canvas.fillSprite(C_BG);
         canvas.setTextDatum(MC_DATUM);
         canvas.setFont(&fonts::FreeSansBold9pt7b);
@@ -411,16 +488,18 @@ bool connectWiFi() {
         canvas.drawString("SOMA FM", SCREEN_W / 2, 40);
         canvas.setFont(&fonts::Font2);
         canvas.setTextColor(C_WHITE);
-        canvas.drawString("Connecting WiFi", SCREEN_W / 2, 70);
+        canvas.drawString("Connecting...", SCREEN_W / 2, 65);
+        canvas.setTextColor(C_GRAY);
+        canvas.drawString(ssid, SCREEN_W / 2, 85);
         String dots = "";
         for (int d = 0; d <= (i % 3); d++) dots += " .";
-        canvas.setTextColor(C_GRAY);
-        canvas.drawString(dots, SCREEN_W / 2, 90);
-        canvas.setFont(&fonts::Font0);
         canvas.setTextColor(C_DARKGRAY);
-        canvas.drawString(WIFI_SSID, SCREEN_W / 2, 115);
+        canvas.drawString(dots, SCREEN_W / 2, 105);
         canvas.pushSprite(0, 0);
     }
+
+    WiFi.disconnect();
+    Serial.printf("[WIFI] Failed to connect to %s\n", ssid.c_str());
     return false;
 }
 
@@ -574,6 +653,28 @@ bool fetchChannels(bool showSplash = true) {
 //  FAVORITES (persisted to NVS)
 // ═══════════════════════════════════════════════════════════
 Preferences prefs;
+
+String loadWifiSSID() {
+    prefs.begin("somafm", true);
+    String ssid = prefs.getString("ssid", "");
+    prefs.end();
+    return ssid;
+}
+
+String loadWifiPass() {
+    prefs.begin("somafm", true);
+    String pass = prefs.getString("pass", "");
+    prefs.end();
+    return pass;
+}
+
+void saveWifiCreds(const String &ssid, const String &pass) {
+    prefs.begin("somafm", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+    prefs.end();
+    Serial.printf("[WIFI] Saved creds for: %s\n", ssid.c_str());
+}
 
 void loadFavorites() {
     prefs.begin("somafm", true);
@@ -1226,7 +1327,21 @@ void audioTask(void *) {
     }
 }
 
+bool ensureWifi() {
+    if (WiFi.status() == WL_CONNECTED) return true;
+    // Try stored creds
+    String ssid = loadWifiSSID();
+    if (ssid.length() > 0) {
+        if (tryWifiConnect(ssid, loadWifiPass())) return true;
+    }
+    // No creds or connect failed — go to WiFi setup
+    startWifiScan();
+    appState = STATE_WIFI_SCAN;
+    return false;
+}
+
 void startPlaying(int idx) {
+    if (!ensureWifi()) return;
     aPaused    = false;
     playingIdx = idx;   // Update UI immediately
     selectedIdx = idx;
@@ -1267,6 +1382,253 @@ void loadSettings() {
 void cycleVisMode() {
     visMode = (visMode + 1) % VIS_COUNT;
     saveSettings();
+}
+
+// ═══════════════════════════════════════════════════════════
+//  WIFI SETUP SCREENS
+// ═══════════════════════════════════════════════════════════
+void drawWifiScan() {
+    canvas.fillSprite(C_BG);
+    String hr = String(scanCount) + " found";
+    drawHeader("WIFI SETUP", hr.c_str());
+
+    if (scanCount == 0) {
+        canvas.setTextDatum(MC_DATUM);
+        canvas.setFont(&fonts::Font2);
+        canvas.setTextColor(C_GRAY);
+        canvas.drawString("No networks found", SCREEN_W / 2, SCREEN_H / 2 - 8);
+        drawFooter("r:Rescan");
+        canvas.pushSprite(0, 0);
+        return;
+    }
+
+    canvas.setFont(&fonts::Font2);
+    int vis = min((int)VISIBLE_LINES, scanCount - scanScrollOff);
+    for (int i = 0; i < vis; i++) {
+        int idx = scanScrollOff + i;
+        int y   = CONTENT_Y + i * LINE_H;
+        bool sel = (idx == scanSelectedIdx);
+
+        if (sel) {
+            for (int j = 0; j < LINE_H; j++) {
+                uint16_t c = blendRGB(C_SELECT, C_BG, j * 200 / LINE_H + 55);
+                canvas.drawFastHLine(0, y + j, SCREEN_W, c);
+            }
+        }
+
+        // Lock/open indicator
+        canvas.setFont(&fonts::Font0);
+        canvas.setTextDatum(ML_DATUM);
+        canvas.setTextColor(scanResults[idx].open ? C_PLAYING : C_ACCENT);
+        canvas.drawString(scanResults[idx].open ? "o" : "#", 4, y + LINE_H / 2);
+
+        // SSID name
+        canvas.setFont(&fonts::Font2);
+        canvas.setTextDatum(ML_DATUM);
+        canvas.setTextColor(sel ? C_WHITE : C_GRAY);
+        canvas.drawString(fitText(canvas, scanResults[idx].ssid, SCREEN_W - 50),
+                          16, y + LINE_H / 2);
+
+        // Signal bars (right side)
+        int rssi = scanResults[idx].rssi;
+        uint16_t sigCol = (rssi > -50) ? C_PLAYING : (rssi > -70) ? C_ACCENT : C_HEADER2;
+        int bars = (rssi > -50) ? 3 : (rssi > -70) ? 2 : 1;
+        int bx = SCREEN_W - 6;
+        int by = y + LINE_H / 2;
+        for (int b = 0; b < 3; b++) {
+            int bh = 3 + b * 2;
+            uint16_t bc = (b < bars) ? sigCol : C_BG_DARK;
+            canvas.fillRect(bx - (3 - b) * 5, by + 4 - bh, 3, bh, bc);
+        }
+    }
+
+    // Scrollbar
+    if (scanCount > (int)VISIBLE_LINES) {
+        int thumbH = max(6, (int)(CONTENT_H * VISIBLE_LINES / scanCount));
+        int thumbY = CONTENT_Y + (CONTENT_H - thumbH) * scanScrollOff /
+                     max(1, scanCount - (int)VISIBLE_LINES);
+        canvas.fillRect(SCREEN_W - 2, CONTENT_Y, 2, CONTENT_H, C_BG_DARK);
+        canvas.fillRect(SCREEN_W - 2, thumbY, 2, thumbH, C_ACCENT);
+    }
+
+    // Error toast
+    if (wifiError.length() > 0 && millis() - wifiErrorTime < 3000) {
+        int ty = SCREEN_H - FOOTER_H - 18;
+        canvas.fillRect(0, ty, SCREEN_W, 16, C_HEADER2);
+        canvas.setFont(&fonts::Font0);
+        canvas.setTextDatum(MC_DATUM);
+        canvas.setTextColor(C_WHITE);
+        canvas.drawString(wifiError, SCREEN_W / 2, ty + 8);
+    } else {
+        wifiError = "";
+    }
+
+    // Footer
+    int fy = SCREEN_H - FOOTER_H;
+    int cy = fy + FOOTER_H / 2 + 1;
+    canvas.fillRect(0, fy, SCREEN_W, FOOTER_H, C_BG_DARK);
+    canvas.drawFastHLine(0, fy, SCREEN_W, C_DARKGRAY);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(C_GRAY);
+    canvas.setTextDatum(ML_DATUM);
+    int x = 4;
+    drawArrow(x + 2, cy, 0, C_GRAY); drawArrow(x + 10, cy, 1, C_GRAY);
+    canvas.drawString(":Nav", x + 16, cy);
+    canvas.drawString("Enter:Select", 56, cy);
+    canvas.drawString("r:Rescan", 148, cy);
+    if (WiFi.status() == WL_CONNECTED && stationCount > 0)
+        canvas.drawString("BS:Back", 204, cy);
+
+    canvas.pushSprite(0, 0);
+}
+
+void drawWifiPass() {
+    canvas.fillSprite(C_BG);
+    drawHeader("ENTER PASSWORD");
+
+    canvas.setTextDatum(TL_DATUM);
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextColor(C_ACCENT);
+    canvas.drawString("Network:", 6, CONTENT_Y + 4);
+    canvas.setTextColor(C_WHITE);
+    canvas.drawString(fitText(canvas, wifiInputSSID, SCREEN_W - 80), 72, CONTENT_Y + 4);
+
+    canvas.setTextColor(C_ACCENT);
+    canvas.drawString("Password:", 6, CONTENT_Y + 24);
+
+    // Char count hint
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextDatum(TR_DATUM);
+    canvas.setTextColor(C_DARKGRAY);
+    canvas.drawString(String(wifiInputPass.length()) + " chars", SCREEN_W - 6, CONTENT_Y + 28);
+
+    // Text input field
+    int fieldX = 6, fieldY = CONTENT_Y + 42, fieldW = SCREEN_W - 12, fieldH = 18;
+    canvas.drawRect(fieldX, fieldY, fieldW, fieldH, C_DARKGRAY);
+    canvas.fillRect(fieldX + 1, fieldY + 1, fieldW - 2, fieldH - 2, C_BG_DARK);
+
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextDatum(ML_DATUM);
+    canvas.setTextColor(C_WHITE);
+    String displayText = wifiInputPass;
+    int maxFieldPx = fieldW - 12;
+    while (canvas.textWidth(displayText) > maxFieldPx && displayText.length() > 1)
+        displayText = displayText.substring(1);
+    canvas.drawString(displayText, fieldX + 4, fieldY + fieldH / 2);
+
+    // Blinking cursor
+    if ((millis() / 500) % 2 == 0) {
+        int curX = fieldX + 4 + canvas.textWidth(displayText);
+        canvas.drawFastVLine(curX, fieldY + 3, fieldH - 6, C_ACCENT);
+    }
+
+    // Error toast
+    if (wifiError.length() > 0 && millis() - wifiErrorTime < 3000) {
+        int ty = CONTENT_Y + 68;
+        canvas.fillRect(0, ty, SCREEN_W, 16, C_HEADER2);
+        canvas.setFont(&fonts::Font0);
+        canvas.setTextDatum(MC_DATUM);
+        canvas.setTextColor(C_WHITE);
+        canvas.drawString(wifiError, SCREEN_W / 2, ty + 8);
+    }
+
+    // Footer
+    int fy = SCREEN_H - FOOTER_H;
+    int cy = fy + FOOTER_H / 2 + 1;
+    canvas.fillRect(0, fy, SCREEN_W, FOOTER_H, C_BG_DARK);
+    canvas.drawFastHLine(0, fy, SCREEN_W, C_DARKGRAY);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(C_GRAY);
+    canvas.setTextDatum(ML_DATUM);
+    canvas.drawString("Enter:Connect", 4, cy);
+    canvas.drawString("BS:Back", 104, cy);
+    canvas.pushSprite(0, 0);
+}
+
+void handleWifiScanKeys() {
+    if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) return;
+    if (millis() - tLastKey < DEBOUNCE_MS) return;
+    tLastKey = millis();
+
+    auto ks = M5Cardputer.Keyboard.keysState();
+
+    if (hasKey(ks.word, ';') || hasKey(ks.word, 'w')) {
+        if (scanSelectedIdx > 0) {
+            scanSelectedIdx--;
+            if (scanSelectedIdx < scanScrollOff) scanScrollOff = scanSelectedIdx;
+        }
+    }
+    if (hasKey(ks.word, '.') || hasKey(ks.word, 's')) {
+        if (scanSelectedIdx < scanCount - 1) {
+            scanSelectedIdx++;
+            if (scanSelectedIdx >= scanScrollOff + (int)VISIBLE_LINES)
+                scanScrollOff = scanSelectedIdx - VISIBLE_LINES + 1;
+        }
+    }
+    if (hasKey(ks.word, 'q')) {
+        scanSelectedIdx  = max(0, scanSelectedIdx - (int)VISIBLE_LINES);
+        scanScrollOff    = max(0, scanScrollOff - (int)VISIBLE_LINES);
+    }
+    if (hasKey(ks.word, 'e')) {
+        scanSelectedIdx = min(scanCount - 1, scanSelectedIdx + (int)VISIBLE_LINES);
+        if (scanSelectedIdx >= scanScrollOff + (int)VISIBLE_LINES)
+            scanScrollOff = min(scanCount - (int)VISIBLE_LINES,
+                                scanSelectedIdx - (int)VISIBLE_LINES + 1);
+    }
+    if (hasKey(ks.word, 'r')) {
+        startWifiScan();
+    }
+    if (ks.enter && scanCount > 0) {
+        wifiInputSSID = scanResults[scanSelectedIdx].ssid;
+        if (scanResults[scanSelectedIdx].open) {
+            if (tryWifiConnect(wifiInputSSID, "")) {
+                saveWifiCreds(wifiInputSSID, "");
+                appState = STATE_BOOT;
+            } else {
+                wifiError = "Connection failed";
+                wifiErrorTime = millis();
+            }
+        } else {
+            wifiInputPass = "";
+            appState = STATE_WIFI_PASS;
+        }
+    }
+    if (ks.del && WiFi.status() == WL_CONNECTED && stationCount > 0) {
+        appState = STATE_BROWSER;
+    }
+}
+
+void handleWifiPassKeys() {
+    if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) return;
+    if (millis() - tLastKey < DEBOUNCE_MS) return;
+    tLastKey = millis();
+
+    auto ks = M5Cardputer.Keyboard.keysState();
+
+    if (ks.del) {
+        if (wifiInputPass.length() > 0) {
+            wifiInputPass = wifiInputPass.substring(0, wifiInputPass.length() - 1);
+        } else {
+            appState = STATE_WIFI_SCAN;
+        }
+        return;
+    }
+    if (ks.enter) {
+        if (tryWifiConnect(wifiInputSSID, wifiInputPass)) {
+            saveWifiCreds(wifiInputSSID, wifiInputPass);
+            appState = STATE_BOOT;
+        } else {
+            wifiError = "Wrong password or timeout";
+            wifiErrorTime = millis();
+        }
+        return;
+    }
+    // Printable characters
+    for (char ch : ks.word) {
+        if (ch >= 32 && ch <= 126 && wifiInputPass.length() < 63) {
+            wifiInputPass += ch;
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1321,6 +1683,7 @@ void handleBrowserKeys() {
         }
     }
     if (hasKey(ks.word, 'f')) { toggleFavorite(selectedIdx); }
+    if (hasKey(ks.word, 'n')) { startWifiScan(); appState = STATE_WIFI_SCAN; }
     if (ks.tab) { cycleVisMode(); }
     if (hasKey(ks.word, ',')) { setVolume((volume > 15) ? volume - 15 : 0); saveSettings(); }
     if (hasKey(ks.word, '/')) { setVolume((volume < 240) ? volume + 15 : 255); saveSettings(); }
@@ -1398,12 +1761,16 @@ void setup() {
     canvas.drawString("SOMA FM", SCREEN_W / 2, 50);
     canvas.setFont(&fonts::Font0);
     canvas.setTextColor(C_DARKGRAY);
-    canvas.drawString("Connecting...", SCREEN_W / 2, 80);
+    canvas.drawString("Starting...", SCREEN_W / 2, 80);
     canvas.pushSprite(0, 0);
 
-    // Start WiFi early (non-blocking) so it connects while we load cache
+    // Start WiFi early (non-blocking) if we have stored credentials
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    String storedSSID = loadWifiSSID();
+    if (storedSSID.length() > 0) {
+        String storedPass = loadWifiPass();
+        WiFi.begin(storedSSID.c_str(), storedPass.c_str());
+    }
 
     // Persistent flash cache for channels + logos
     if (!LittleFS.begin(true)) {
@@ -1443,21 +1810,31 @@ void loop() {
 
     // ── Boot sequence ──
     if (appState == STATE_BOOT) {
+        // Must have WiFi creds before anything else
+        String storedSSID = loadWifiSSID();
+        if (storedSSID.length() == 0) {
+            startWifiScan();
+            appState = STATE_WIFI_SCAN;
+            return;
+        }
+
+        // Have creds — try cache for instant boot
         if (loadCachedChannels()) {
-            // Instant boot from cache — show browser immediately
             Serial.printf("[BOOT] Cached %d stations\n", stationCount);
             loadFavorites();
             sortStations();
             restoreLastStation();
             appState = STATE_BROWSER;
-            needsRefresh = true;  // refresh from network on next passes
-            return;  // show UI immediately, don't block on WiFi
+            needsRefresh = true;  // refresh from network in background
+            return;
         }
-        // No cache — must fetch from network
-        if (!connectWiFi()) {
-            errorMsg = "WiFi connection failed";
-            appState = STATE_ERROR;
-            drawError();
+
+        // No cache — need network now
+        if (!tryWifiConnect(storedSSID, loadWifiPass())) {
+            wifiError = "Saved network failed";
+            wifiErrorTime = millis();
+            startWifiScan();
+            appState = STATE_WIFI_SCAN;
             return;
         }
         if (!fetchChannels()) {
@@ -1472,22 +1849,33 @@ void loop() {
     }
 
     // ── Deferred network refresh (non-blocking — only when WiFi ready) ──
-    if (needsRefresh && WiFi.status() == WL_CONNECTED) {
-        needsRefresh = false;
-        Serial.println("[REFRESH] WiFi connected, updating channels...");
-        if (fetchChannels(false)) {
-            loadFavorites();
-            sortStations();
-            restoreLastStation();
-            Serial.println("[REFRESH] Updated from network");
+    if (needsRefresh) {
+        if (WiFi.status() == WL_CONNECTED) {
+            needsRefresh = false;
+            Serial.println("[REFRESH] WiFi connected, updating channels...");
+            if (fetchChannels(false)) {
+                loadFavorites();
+                sortStations();
+                restoreLastStation();
+                Serial.println("[REFRESH] Updated from network");
+            }
+        } else if (millis() > 15000) {
+            // WiFi hasn't connected after 15s — stored creds likely bad
+            needsRefresh = false;
+            Serial.println("[REFRESH] WiFi timeout — showing scan screen");
+            startWifiScan();
+            appState = STATE_WIFI_SCAN;
+            return;
         }
     }
 
     // ── Input ──
     switch (appState) {
-        case STATE_BROWSER: handleBrowserKeys(); break;
-        case STATE_PLAYING: handlePlayerKeys();  break;
-        case STATE_ERROR:   handleErrorKeys();   break;
+        case STATE_WIFI_SCAN: handleWifiScanKeys(); break;
+        case STATE_WIFI_PASS: handleWifiPassKeys(); break;
+        case STATE_BROWSER:   handleBrowserKeys();  break;
+        case STATE_PLAYING:   handlePlayerKeys();   break;
+        case STATE_ERROR:     handleErrorKeys();    break;
         default: break;
     }
 
@@ -1507,9 +1895,11 @@ void loop() {
     if (millis() - tLastUI > UI_MS) {
         tLastUI = millis();
         switch (appState) {
-            case STATE_BROWSER: drawBrowser(); break;
-            case STATE_PLAYING: drawPlayer();  break;
-            case STATE_ERROR:   drawError();   break;
+            case STATE_WIFI_SCAN: drawWifiScan(); break;
+            case STATE_WIFI_PASS: drawWifiPass(); break;
+            case STATE_BROWSER:   drawBrowser();  break;
+            case STATE_PLAYING:   drawPlayer();   break;
+            case STATE_ERROR:     drawError();    break;
             default: break;
         }
     }

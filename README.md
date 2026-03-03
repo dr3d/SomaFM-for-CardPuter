@@ -10,6 +10,8 @@ Internet radio player for the **M5Stack Cardputer** that streams all [SOMA FM](h
 
 ## Features
 
+- On-device WiFi setup — scan, select, and enter password right on the Cardputer
+- WiFi credentials remembered in flash (no hardcoded config needed)
 - Browse all SOMA FM stations with genre-colored list
 - MP3 streaming via direct I2S output (gapless, no choppy audio)
 - Station logos fetched and scaled from SOMA FM
@@ -44,6 +46,7 @@ No PSRAM required.
 | `e` | Page down |
 | `,` / `/` | Volume down / up |
 | `f` | Toggle favorite |
+| `n` | WiFi setup (change network) |
 | `Space` | Pause / resume (or play selected) |
 | `Tab` | Cycle visualizer (off / bars / wave / VU) |
 | `Enter` | Play station |
@@ -61,16 +64,12 @@ No PSRAM required.
 
 ## Setup
 
-1. Copy `include/config.example.h` to `include/config.h` and set your WiFi credentials:
-   ```cpp
-   #define WIFI_SSID "your_ssid"
-   #define WIFI_PASS "your_password"
-   ```
-
-2. Build and upload with PlatformIO:
+1. Build and upload with PlatformIO:
    ```
    pio run -e cardputer -t upload
    ```
+
+2. On first boot, the WiFi scan screen appears automatically. Select your network and enter the password — credentials are saved to flash and remembered across reboots. Press `n` in the browser to change networks later.
 
 ## Dependencies
 
@@ -88,5 +87,6 @@ Managed automatically by PlatformIO:
 - **Core 1**: UI rendering + input handling + network fetches
 - Direct I2S output on port 1 bypasses M5.Speaker for gapless audio
 - On Cardputer ADV, ES8311 codec is initialized via I2C; on the original Cardputer, the NS4168 amplifier needs no configuration
-- Favorites and last station stored in NVS flash via the Preferences library
+- WiFi credentials, favorites, and last station stored in NVS flash via the Preferences library
+- On-device WiFi scan and password entry — no hardcoded credentials needed
 - Channel list and logos cached to LittleFS for instant startup on subsequent boots
