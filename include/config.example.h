@@ -13,4 +13,4 @@
 // ──────────────────────────────────────────────────────────
 #define DEFAULT_VOLUME  100     // 0-255
 #define MAX_STATIONS    50
-#define AUDIO_BUF_SIZE  4096    // HTTP stream buffer (bytes)
+#define AUDIO_BUF_SIZE  8192    // HTTP stream buffer (bytes)

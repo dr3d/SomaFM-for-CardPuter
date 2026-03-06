@@ -24,6 +24,8 @@ Internet radio player for the **M5Stack Cardputer** that streams all [SOMA FM](h
 - Battery level gauge in the header bar
 - Audio visualizers: EQ bars, waveform, VU meter (Tab to cycle)
 - Volume control with on-screen bar (remembered across reboots)
+- Auto-repeat scrolling in station browser (hold up/down)
+- Screen dims after 15s idle when playing with visualizer off
 - Quick station switching without stopping playback
 
 ## Hardware
@@ -40,8 +42,8 @@ No PSRAM required.
 ### Station Browser
 | Key | Action |
 |-----|--------|
-| `w` / `;` | Scroll up |
-| `s` / `.` | Scroll down |
+| `w` / `;` | Scroll up (hold to repeat) |
+| `s` / `.` | Scroll down (hold to repeat) |
 | `q` | Page up |
 | `e` | Page down |
 | `,` / `/` | Volume down / up |

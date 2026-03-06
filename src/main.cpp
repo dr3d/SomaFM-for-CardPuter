@@ -128,9 +128,16 @@ volatile int  aTarget     = -1;
 unsigned long tLastUI     = 0;
 unsigned long tLastNP     = 0;
 unsigned long tLastKey    = 0;
+unsigned long tLastInput  = 0;   // last user interaction (for screen dim)
 const unsigned long DEBOUNCE_MS   = 180;
+const unsigned long REPEAT_INIT   = 400;  // ms before auto-repeat starts
+const unsigned long REPEAT_MS     = 80;   // ms between repeats
 const unsigned long UI_MS         = 66;
 const unsigned long NP_MS         = 30000;
+const unsigned long DIM_TIMEOUT   = 15000; // dim screen after 15s idle
+const uint8_t BRIGHTNESS_NORMAL   = 80;
+const uint8_t BRIGHTNESS_DIM      = 10;
+bool screenDimmed = false;
 
 // Audio visualizer
 #define VIS_OFF   0
@@ -1271,6 +1278,8 @@ void cleanupAudio() {
     if (audioBuf)  { delete audioBuf;  audioBuf  = nullptr; }
     if (audioSrc)  { delete audioSrc;  audioSrc  = nullptr; }
     aRunning = false;
+    // Flush I2S DMA buffers so old audio doesn't bleed into new stream
+    if (audioOut) audioOut->stop();
 }
 
 // ── Audio FreeRTOS task (Core 0) ─────────────────────────
@@ -1292,6 +1301,8 @@ void audioTask(void *) {
 
                     audioSrc = new AudioFileSourceHTTPStream(url.c_str());
                     audioBuf = new AudioFileSourceBuffer(audioSrc, AUDIO_BUF_SIZE);
+                    // Pre-fill buffer before starting decoder to avoid initial stutter
+                    audioBuf->loop();
                     mp3      = new AudioGeneratorMP3();
 
                     if (mp3->begin(audioBuf, audioOut)) {
@@ -1634,26 +1645,70 @@ void handleWifiPassKeys() {
 // ═══════════════════════════════════════════════════════════
 //  INPUT HANDLING
 // ═══════════════════════════════════════════════════════════
-void handleBrowserKeys() {
-    if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) return;
-    if (millis() - tLastKey < DEBOUNCE_MS) return;
-    tLastKey = millis();
+void wakeScreen() {
+    if (screenDimmed) {
+        M5.Display.setBrightness(BRIGHTNESS_NORMAL);
+        screenDimmed = false;
+    }
+    tLastInput = millis();
+}
 
+void browserScrollUp() {
+    if (selectedIdx > 0) {
+        selectedIdx--;
+        if (selectedIdx < scrollOffset) scrollOffset = selectedIdx;
+    }
+}
+
+void browserScrollDown() {
+    if (selectedIdx < stationCount - 1) {
+        selectedIdx++;
+        if (selectedIdx >= scrollOffset + (int)VISIBLE_LINES)
+            scrollOffset = selectedIdx - VISIBLE_LINES + 1;
+    }
+}
+
+// Auto-repeat state for browser up/down
+static unsigned long repeatStart = 0;
+static unsigned long repeatLast  = 0;
+static int           repeatDir   = 0; // -1=up, 1=down, 0=none
+
+void handleBrowserKeys() {
+    bool anyPressed = M5Cardputer.Keyboard.isPressed();
     auto ks = M5Cardputer.Keyboard.keysState();
 
-    if (hasKey(ks.word, ';') || hasKey(ks.word, 'w')) {
-        if (selectedIdx > 0) {
-            selectedIdx--;
-            if (selectedIdx < scrollOffset) scrollOffset = selectedIdx;
+    bool upHeld   = anyPressed && (hasKey(ks.word, ';') || hasKey(ks.word, 'w'));
+    bool downHeld = anyPressed && (hasKey(ks.word, '.') || hasKey(ks.word, 's'));
+
+    // Auto-repeat for up/down
+    if (upHeld || downHeld) {
+        int dir = upHeld ? -1 : 1;
+        unsigned long now = millis();
+        if (dir != repeatDir) {
+            // New direction — first press
+            repeatDir   = dir;
+            repeatStart = now;
+            repeatLast  = now;
+            if (dir < 0) browserScrollUp(); else browserScrollDown();
+            wakeScreen();
+            return;
         }
-    }
-    if (hasKey(ks.word, '.') || hasKey(ks.word, 's')) {
-        if (selectedIdx < stationCount - 1) {
-            selectedIdx++;
-            if (selectedIdx >= scrollOffset + (int)VISIBLE_LINES)
-                scrollOffset = selectedIdx - VISIBLE_LINES + 1;
+        // Held — check for repeat
+        if (now - repeatStart > REPEAT_INIT && now - repeatLast > REPEAT_MS) {
+            repeatLast = now;
+            if (dir < 0) browserScrollUp(); else browserScrollDown();
         }
+        return;
+    } else {
+        repeatDir = 0;
     }
+
+    // Standard debounced keys
+    if (!M5Cardputer.Keyboard.isChange() || !anyPressed) return;
+    if (millis() - tLastKey < DEBOUNCE_MS) return;
+    tLastKey = millis();
+    wakeScreen();
+
     if (hasKey(ks.word, 'q')) {
         selectedIdx  = max(0, selectedIdx - (int)VISIBLE_LINES);
         scrollOffset = max(0, scrollOffset - (int)VISIBLE_LINES);
@@ -1666,7 +1721,7 @@ void handleBrowserKeys() {
     }
     if (ks.enter) {
         nowTrack = "";
-        freeLogo();       // Clear old logo
+        freeLogo();
         startPlaying(selectedIdx);
         appState = STATE_PLAYING;
         tLastNP  = 0;
@@ -1692,12 +1747,14 @@ void handleBrowserKeys() {
 void handlePlayerKeys() {
     // G0 button (BtnA) → back to browser
     if (M5.BtnA.wasPressed()) {
+        wakeScreen();
         appState = STATE_BROWSER;
         return;
     }
     if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) return;
     if (millis() - tLastKey < DEBOUNCE_MS) return;
     tLastKey = millis();
+    wakeScreen();
 
     auto ks = M5Cardputer.Keyboard.keysState();
 
@@ -1889,6 +1946,13 @@ void loop() {
         if (logoForIdx != playingIdx) {
             downloadLogo(playingIdx);
         }
+    }
+
+    // ── Screen dimming (playing + visualizer off + idle) ──
+    if (appState == STATE_PLAYING && visMode == VIS_OFF && aRunning &&
+        !screenDimmed && tLastInput > 0 && millis() - tLastInput > DIM_TIMEOUT) {
+        M5.Display.setBrightness(BRIGHTNESS_DIM);
+        screenDimmed = true;
     }
 
     // ── UI redraw ──
